@@ -65,6 +65,25 @@ const iceServersConfig = {
   ]
 };
 
+const RemoteVideo = ({ stream }) => {
+  return (
+    <video
+      ref={(el) => {
+        if (el && stream) {
+          el.srcObject = stream;
+        }
+      }}
+      autoPlay
+      playsInline
+      style={{
+        width: '100%',
+        height: '100%',
+        objectFit: 'cover'
+      }}
+    />
+  );
+};
+
 const VideoMeet = () => {
   const { roomId } = useParams();
   const { user } = useAuth();
@@ -127,8 +146,10 @@ const VideoMeet = () => {
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
 
   // HTML Video Elements refs for streams
-  const localVideoRef = useRef(null);
   const chatBottomRef = useRef(null);
+  const [peerStreams, setPeerStreams] = useState({}); // { socketId: MediaStream }
+  const [localStream, setLocalStream] = useState(null);
+  const candidateQueues = useRef({}); // { socketId: [RTCIceCandidate] }
 
   // 1. Initial Device Enumerate & Setup
   useEffect(() => {
@@ -155,13 +176,6 @@ const VideoMeet = () => {
       }, 1000);
     }
     return () => clearInterval(interval);
-  }, [meetingJoined]);
-
-  // Bind local stream to the new video element after joining
-  useEffect(() => {
-    if (meetingJoined && localVideoRef.current && localStreamRef.current) {
-      localVideoRef.current.srcObject = localStreamRef.current;
-    }
   }, [meetingJoined]);
 
   // Handle auto-scroll for chat message list
@@ -221,6 +235,7 @@ const VideoMeet = () => {
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       localStreamRef.current = stream;
+      setLocalStream(stream);
 
       // Apply initial enabled preferences
       const camSetting = localStorage.getItem('blink_setting_camera');
@@ -231,10 +246,6 @@ const VideoMeet = () => {
 
       stream.getVideoTracks().forEach(track => track.enabled = camOn);
       stream.getAudioTracks().forEach(track => track.enabled = micOn);
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
     } catch (err) {
       console.error('Failed to get media preview:', err);
     }
@@ -247,7 +258,11 @@ const VideoMeet = () => {
     const backendUrl = import.meta.env.VITE_API_URL 
       ? import.meta.env.VITE_API_URL.replace('/api', '') 
       : `http://${window.location.hostname}:5000`;
-    socketRef.current = io(backendUrl);
+    socketRef.current = io(backendUrl, {
+      transports: ['websocket', 'polling'],
+      secure: true,
+      rejectUnauthorized: false
+    });
 
     const isHost = user?.username === meetingCreator;
     const wrSetting = localStorage.getItem('blink_setting_waitingroom');
@@ -341,6 +356,9 @@ const VideoMeet = () => {
           targetSocketId: senderSocketId,
           answer
         });
+
+        // Flush candidates
+        await processQueuedCandidates(senderSocketId);
       } catch (err) {
         console.error('Error handling SDP offer:', err);
       }
@@ -353,6 +371,8 @@ const VideoMeet = () => {
       if (pc) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          // Flush candidates
+          await processQueuedCandidates(senderSocketId);
         } catch (err) {
           console.error('Error handling SDP answer:', err);
         }
@@ -363,10 +383,18 @@ const VideoMeet = () => {
     socketRef.current.on('receive-ice-candidate', async ({ senderSocketId, candidate }) => {
       const pc = pcs.current[senderSocketId];
       if (pc && candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error('Error adding ICE candidate:', err);
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          } catch (err) {
+            console.error('Error adding ICE candidate:', err);
+          }
+        } else {
+          // Queue candidate
+          if (!candidateQueues.current[senderSocketId]) {
+            candidateQueues.current[senderSocketId] = [];
+          }
+          candidateQueues.current[senderSocketId].push(candidate);
         }
       }
     });
@@ -456,6 +484,16 @@ const VideoMeet = () => {
       if (remoteStreams.current[socketId]) {
         delete remoteStreams.current[socketId];
       }
+
+      setPeerStreams(prev => {
+        const next = { ...prev };
+        delete next[socketId];
+        return next;
+      });
+
+      if (candidateQueues.current[socketId]) {
+        delete candidateQueues.current[socketId];
+      }
       
       setParticipants(prev => prev.filter(p => p.socketId !== socketId));
       
@@ -488,10 +526,28 @@ const VideoMeet = () => {
     }
   };
 
+  // Helper to flush queued candidates
+  const processQueuedCandidates = async (socketId) => {
+    const pc = pcs.current[socketId];
+    const queue = candidateQueues.current[socketId];
+    if (pc && queue && queue.length > 0) {
+      console.log(`Processing ${queue.length} queued ICE candidates for ${socketId}`);
+      for (const candidate of queue) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding queued ICE candidate:', err);
+        }
+      }
+      candidateQueues.current[socketId] = [];
+    }
+  };
+
   // 3. WebRTC Peer Connection Core Logic
   const createPeerConnection = (peerSocketId) => {
     // Create new RTCPeerConnection with STUN servers config
     const pc = new RTCPeerConnection(iceServersConfig);
+    candidateQueues.current[peerSocketId] = [];
 
     // Track ICE Candidate generation
     pc.onicecandidate = (event) => {
@@ -511,11 +567,11 @@ const VideoMeet = () => {
       // Save remote stream object in ref
       remoteStreams.current[peerSocketId] = stream;
 
-      // Update the stream element in HTML dynamically
-      const videoElement = document.getElementById(`video-${peerSocketId}`);
-      if (videoElement) {
-        videoElement.srcObject = stream;
-      }
+      // Update state to trigger re-render
+      setPeerStreams(prev => ({
+        ...prev,
+        [peerSocketId]: stream
+      }));
     };
 
     // Track connection state changes
@@ -835,6 +891,9 @@ const VideoMeet = () => {
     }
     pcs.current = {};
     remoteStreams.current = {};
+    setPeerStreams({});
+    setLocalStream(null);
+    candidateQueues.current = {};
   };
 
   const leaveMeeting = () => {
@@ -925,7 +984,11 @@ const VideoMeet = () => {
           <Grid item xs={12} md={7}>
             <Box sx={{ position: 'relative', width: '100%', aspectRatio: '16/9', borderRadius: '16px', overflow: 'hidden', backgroundColor: '#09090b', border: '1px solid var(--card-border)' }}>
               <video
-                ref={localVideoRef}
+                ref={(el) => {
+                  if (el && localStream) {
+                    el.srcObject = localStream;
+                  }
+                }}
                 autoPlay
                 playsInline
                 muted
@@ -1115,7 +1178,11 @@ const VideoMeet = () => {
                 }}
               >
                 <video
-                  ref={localVideoRef}
+                  ref={(el) => {
+                    if (el && localStream) {
+                      el.srcObject = localStream;
+                    }
+                  }}
                   autoPlay
                   playsInline
                   muted
@@ -1138,7 +1205,7 @@ const VideoMeet = () => {
                 {/* Overlaid labels */}
                 <Box sx={{ position: 'absolute', bottom: 12, left: 12, display: 'flex', alignItems: 'center', gap: 1, backgroundColor: 'rgba(0,0,0,0.6)', px: 1.2, py: 0.6, borderRadius: '6px', backdropFilter: 'blur(4px)' }}>
                   <Typography variant="caption" sx={{ color: '#fff', fontWeight: 600 }}>
-                    Sarah (You)
+                    {user?.name || user?.username} (You)
                   </Typography>
                   {handRaised && <PanTool sx={{ color: 'var(--warning)', fontSize: 14 }} />}
                   {!audioEnabled ? <MicOff sx={{ color: 'var(--danger)', fontSize: 14 }} /> : <Mic sx={{ color: 'var(--success)', fontSize: 14 }} />}
@@ -1155,14 +1222,6 @@ const VideoMeet = () => {
 
             {/* B. Remote video feeds */}
             {participants.map((peer) => {
-              // Automatically bind remote stream once ref renders
-              setTimeout(() => {
-                const el = document.getElementById(`video-${peer.socketId}`);
-                if (el && remoteStreams.current[peer.socketId]) {
-                  el.srcObject = remoteStreams.current[peer.socketId];
-                }
-              }, 100);
-
               return (
                 <Grid item {...gridSizes} key={peer.socketId} sx={{ display: 'flex', justifyContent: 'center', height: participantCount <= 2 ? '80%' : 'auto', maxHeight: '450px' }}>
                   <Box
@@ -1178,16 +1237,7 @@ const VideoMeet = () => {
                       transition: 'var(--transition-fast)'
                     }}
                   >
-                    <video
-                      id={`video-${peer.socketId}`}
-                      autoPlay
-                      playsInline
-                      style={{
-                        width: '100%',
-                        height: '100%',
-                        objectFit: 'cover'
-                      }}
-                    />
+                    <RemoteVideo stream={peerStreams[peer.socketId]} />
 
                     {/* Remote user camera turned off block */}
                      {!peer.video && (
